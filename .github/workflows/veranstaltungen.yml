@@ -1,0 +1,130 @@
+name: Volt Aachen Veranstaltungen
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: volt-aachen-veranstaltungen
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Abhängigkeiten installieren
+        run: python -m pip install requests beautifulsoup4 icalendar
+      - name: Neue Veranstaltungen veröffentlichen
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import time
+          from datetime import date, datetime
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          from zoneinfo import ZoneInfo
+
+          import requests
+          from bs4 import BeautifulSoup, Tag
+          from icalendar import Calendar
+
+          BASE = 'https://voltdeutschland.org/aachen/veranstaltungen'
+          STATE = Path('veroeffentlichte_events.json')
+          berlin = ZoneInfo('Europe/Berlin')
+          webhook = os.environ['DISCORD_WEBHOOK_URL']
+          session = requests.Session()
+          session.headers.update({'User-Agent': 'VoltAachenDiscordEvents/1.0 (public events notification)'})
+
+          response = session.get(BASE, timeout=30)
+          response.raise_for_status()
+          soup = BeautifulSoup(response.text, 'html.parser')
+          heading = next((h for h in soup.find_all('h2') if 'Termine von Volt Aachen' in h.get_text(' ', strip=True)), None)
+          if heading is None:
+              raise RuntimeError('Überschrift "Termine von Volt Aachen" nicht gefunden; keine Posts gesendet.')
+
+          links = {}
+          for element in heading.next_elements:
+              if isinstance(element, Tag) and element.name == 'h2':
+                  break
+              if not isinstance(element, Tag) or element.name != 'a' or not element.get('href'):
+                  continue
+              link = urljoin(BASE, element['href']).split('#')[0].split('?')[0].rstrip('/')
+              path = urlparse(link).path
+              if (path.startswith('/aachen/veranstaltungen/') and
+                  path != '/aachen/veranstaltungen' and
+                  not path.endswith('.ics')):
+                  links[link] = True
+          if not links:
+              raise RuntimeError('Keine Veranstaltungslinks im Aachener Bereich gefunden; keine Posts gesendet.')
+
+          published = set(json.loads(STATE.read_text(encoding='utf-8'))) if STATE.exists() else set()
+          events = []
+          for link in links:
+              ics = session.get(link + '/calendar.ics', timeout=30)
+              ics.raise_for_status()
+              cal = Calendar.from_ical(ics.content)
+              components = list(cal.walk('VEVENT'))
+              if not components:
+                  raise RuntimeError(f'Keine Kalenderdaten: {link}')
+              event = components[0]
+              start = event.decoded('DTSTART')
+              start_date = start.date() if isinstance(start, datetime) else start
+              if not isinstance(start_date, date) or start_date < datetime.now(berlin).date():
+                  continue
+              summary = str(event.get('SUMMARY', 'Volt Aachen Veranstaltung')).strip()
+              location = str(event.get('LOCATION', '')).strip()
+              if isinstance(start, datetime):
+                  start_local = start.replace(tzinfo=berlin) if start.tzinfo is None else start.astimezone(berlin)
+                  when = start_local.strftime('%d.%m.%Y, %H:%M Uhr')
+              else:
+                  when = start.strftime('%d.%m.%Y')
+              events.append((start_date, link, summary, location, when))
+
+          for _, link, summary, location, when in sorted(events):
+              if link in published:
+                  continue
+              description = f'📅 **{when}**'
+              if location:
+                  description += f'\n📍 {location}'
+              payload = {
+                  'username': 'Volt Aachen Events',
+                  'allowed_mentions': {'parse': []},
+                  'embeds': [{
+                      'title': summary[:256],
+                      'url': link,
+                      'description': description[:4096] + '\n\n💜 [Weitere Infos & Anmeldung](' + link + ')',
+                      'color': 6700968,
+                      'footer': {'text': 'Volt Aachen · Automatische Veranstaltungsankündigung'}
+                  }]
+              }
+              post = session.post(webhook, json=payload, timeout=30)
+              post.raise_for_status()
+              published.add(link)
+              STATE.write_text(json.dumps(sorted(published), indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+              print('Veröffentlicht:', summary)
+              time.sleep(1)
+          print('Prüfung fertig. Bereits bekannte Events:', len(published))
+          PY
+      - name: Veröffentlichungsstand speichern
+        run: |
+          if ! git diff --quiet -- veroeffentlichte_events.json || [ -n "$(git ls-files --others --exclude-standard -- veroeffentlichte_events.json)" ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add veroeffentlichte_events.json
+            git commit -m 'Update published Volt Aachen events'
+            git push
+          fi
